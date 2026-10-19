@@ -467,8 +467,14 @@ struct ReaderServerView: View {
                 }
 
                 if store.isReaderServerSyncing {
-                    ProgressView(value: 0.62)
+                    ProgressView()
                         .tint(AppTheme.accent)
+                }
+
+                if !store.readerServerSyncMessage.isEmpty {
+                    Text(store.readerServerSyncMessage)
+                        .font(.footnote)
+                        .foregroundStyle(AppTheme.mutedInk)
                 }
 
                 Button {
@@ -913,6 +919,8 @@ struct NASConnectionEditorView: View {
     @State private var usesHTTPS: Bool
     @State private var usesFullURL: Bool
     @State private var fullURL: String
+    @State private var isTesting = false
+    @State private var connectionError: String?
 
     init(connection: NASConnection? = nil) {
         editingConnection = connection
@@ -1021,6 +1029,13 @@ struct NASConnectionEditorView: View {
                 }
 
                 Section {
+                    if isTesting {
+                        ProgressView("正在验证账号并连接阅读服务器…")
+                    }
+                    if let connectionError {
+                        Label(connectionError, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                    }
                     Text(previewURLText)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -1044,7 +1059,7 @@ struct NASConnectionEditorView: View {
                     Button("保存") {
                         save()
                     }
-                    .disabled(resolvedURL == nil)
+                    .disabled(resolvedURL == nil || isTesting)
                 }
             }
             #if os(macOS)
@@ -1089,12 +1104,24 @@ struct NASConnectionEditorView: View {
             password: password,
             isEnabled: true
         )
-        if editingConnection == nil {
-            store.addConnection(connection)
-        } else {
+        guard kind == .readerServer else {
             store.updateConnection(connection)
+            dismiss()
+            return
         }
-        dismiss()
+        isTesting = true
+        connectionError = nil
+        Task {
+            defer { isTesting = false }
+            do {
+                try await store.validateReaderServerConnection(connection)
+                store.updateConnection(connection)
+                dismiss()
+                await store.syncReaderServerShelfToLocal()
+            } catch {
+                connectionError = error.localizedDescription
+            }
+        }
     }
 
     private func defaultName(for url: URL) -> String {

@@ -153,55 +153,20 @@ struct FontPickerView: View {
         store.save()
     }
 
-    private func fontsDirectory() -> URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("Fonts", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-
     private func installFont(from sourceURL: URL) {
-        let dest = fontsDirectory().appendingPathComponent(sourceURL.lastPathComponent)
         do {
-            if FileManager.default.fileExists(atPath: dest.path) {
-                try FileManager.default.removeItem(at: dest)
-            }
-            try FileManager.default.copyItem(at: sourceURL, to: dest)
+            let font = try ImportedFontLibrary().installFont(from: sourceURL)
+            loadImportedFonts()
+            store.readerTheme.customFontName = font.id
+            store.save()
         } catch {
-            importError = "复制文件失败：\(error.localizedDescription)"
-            return
+            importError = "导入字体失败：\(error.localizedDescription)"
         }
-
-        var error: Unmanaged<CFError>?
-        let registered = CTFontManagerRegisterFontsForURL(dest as CFURL, .process, &error)
-        if !registered {
-            importError = "注册字体失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")"
-            return
-        }
-
-        let font = CTFontCreateWithName(dest.deletingPathExtension().lastPathComponent as CFString, 12, nil)
-        let psName = CTFontCopyPostScriptName(font) as String
-        loadImportedFonts()
-        store.readerTheme.customFontName = psName
-        store.save()
     }
 
     private func loadImportedFonts() {
-        let dir = fontsDirectory()
-        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
-        let fontFiles = files.filter { ["ttf", "otf"].contains($0.pathExtension.lowercased()) }
-
-        var error: Unmanaged<CFError>?
-        for url in fontFiles {
-            CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error)
-        }
-
-        importedFonts = fontFiles.compactMap { url in
-            let font = CTFontCreateWithName(url.deletingPathExtension().lastPathComponent as CFString, 12, nil)
-            let psName = CTFontCopyPostScriptName(font) as String
-            let fullName = CTFontCopyFullName(font) as String
-            guard !psName.isEmpty else { return nil }
-            return FontOption(id: psName, displayName: fullName.isEmpty ? url.deletingPathExtension().lastPathComponent : fullName, category: "已导入")
+        importedFonts = ImportedFontLibrary().registerImportedFonts().map { font in
+            FontOption(id: font.id, displayName: font.displayName, category: "已导入")
         }
     }
 }

@@ -7,14 +7,24 @@ struct ShelfView: View {
     @State private var searchText = ""
     @State private var isImporterPresented = false
     @State private var selectedBook: Book?
+    @State private var readingBook: Book?
 
     private var filteredBooks: [Book] {
-        store.books.filter { book in
+        let books = store.books.filter { book in
             let matchesStatus = statusFilter == nil || book.status == statusFilter
             let matchesSearch = searchText.isEmpty
                 || book.title.localizedCaseInsensitiveContains(searchText)
                 || book.author.localizedCaseInsensitiveContains(searchText)
             return matchesStatus && matchesSearch
+        }
+        guard statusFilter == nil else { return books }
+        return books.sorted { lhs, rhs in
+            let lhsReadAt = lhs.lastReadAt ?? .distantPast
+            let rhsReadAt = rhs.lastReadAt ?? .distantPast
+            if lhsReadAt != rhsReadAt {
+                return lhsReadAt > rhsReadAt
+            }
+            return lhs.addedAt > rhs.addedAt
         }
     }
 
@@ -52,6 +62,26 @@ struct ShelfView: View {
                         }
                         .padding(.top, 18)
 
+                        if !store.needsServerSetup {
+                            PremiumCard {
+                                HStack(spacing: 12) {
+                                    if store.isReaderServerSyncing {
+                                        ProgressView()
+                                    }
+                                    Text(store.readerServerSyncMessage.isEmpty
+                                         ? "点击同步，将阅读服务器的书架导入本机。"
+                                         : store.readerServerSyncMessage)
+                                        .font(.subheadline)
+                                        .foregroundStyle(AppTheme.mutedInk)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Button("同步书架") {
+                                        Task { await store.syncReaderServerShelfToLocal() }
+                                    }
+                                    .disabled(store.isReaderServerSyncing)
+                                }
+                            }
+                        }
+
                         // Filter
                         SegmentedPillBar(options: filterOptions, selection: $statusFilter)
 
@@ -78,7 +108,11 @@ struct ShelfView: View {
                         } else {
                             LazyVStack(spacing: 10) {
                                 ForEach(filteredBooks) { book in
-                                    ShelfBookCell(book: book) { selectedBook = book }
+                                    ShelfBookCell(
+                                        book: book,
+                                        readAction: { readingBook = book },
+                                        detailAction: { selectedBook = book }
+                                    )
                                 }
                             }
                         }
@@ -88,6 +122,7 @@ struct ShelfView: View {
                 }
             }
             .platformInlineNavigationTitle()
+            .refreshable { await store.syncReaderServerShelfToLocal() }
             .onChange(of: searchText) { _, v in store.searchLibrary(keyword: v) }
             .fileImporter(isPresented: $isImporterPresented,
                           allowedContentTypes: [.plainText, .epub],
@@ -95,6 +130,17 @@ struct ShelfView: View {
             .sheet(item: $selectedBook) { book in
                 BookDetailView(book: book).environmentObject(store)
             }
+            #if os(macOS)
+            .sheet(item: $readingBook) { book in
+                ReaderView(book: book)
+                    .environmentObject(store)
+                    .frame(minWidth: 800, idealWidth: 1100, minHeight: 650, idealHeight: 850)
+            }
+            #else
+            .fullScreenCover(item: $readingBook) { book in
+                ReaderView(book: book).environmentObject(store)
+            }
+            #endif
         }
     }
 
@@ -110,14 +156,16 @@ struct ShelfView: View {
 
 struct ShelfBookCell: View {
     var book: Book
-    var action: () -> Void
+    var readAction: () -> Void
+    var detailAction: () -> Void
+    private let coverWidth: CGFloat = 62
 
     var body: some View {
-        Button(action: action) {
+        Button(action: readAction) {
             PremiumCard {
                 HStack(alignment: .top, spacing: 14) {
                     BookCoverView(book: book)
-                        .frame(width: 62)
+                        .frame(width: coverWidth)
 
                     VStack(alignment: .leading, spacing: 0) {
                         Text(book.title)
@@ -162,6 +210,18 @@ struct ShelfBookCell: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("继续阅读《\(book.title)》")
+        // A sibling button over the cover keeps its action separate from the card.
+        .overlay(alignment: .topLeading) {
+            Button(action: detailAction) {
+                Color.clear
+                    .frame(width: coverWidth, height: coverWidth / 0.68)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("查看《\(book.title)》详情")
+            .padding(16)
+        }
     }
 }
 

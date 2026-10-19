@@ -16,6 +16,7 @@ struct CloudBookMetadata: Codable {
     var status: ReadingStatus
     var progress: ReadingProgress
     var updatedAt: Date
+    var lastReadAt: Date?
 }
 
 enum CloudSyncError: LocalizedError {

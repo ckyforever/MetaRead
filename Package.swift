@@ -21,7 +21,8 @@ let package = Package(
         ),
         .testTarget(
             name: "NovelReaderAppTests",
-            dependencies: ["NovelReaderApp"]
+            dependencies: ["NovelReaderApp"],
+            resources: [.copy("Fixtures")]
         )
     ]
 )

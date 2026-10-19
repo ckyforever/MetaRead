@@ -23,6 +23,147 @@ enum AppServiceError: LocalizedError {
     }
 }
 
+/// Reader's secure mode uses /reader3/login and an accessToken, rather than Basic Auth.
+/// Keep tokens in memory and scope them to both the server and the supplied credentials.
+@MainActor
+final class ReaderServerAPI {
+    private struct Credentials: Hashable {
+        var baseURL: URL
+        var username: String
+        var password: String
+    }
+
+    private struct Status: Decodable {
+        var isSuccess: Bool
+        var errorMsg: String?
+        var data: String?
+
+        private enum CodingKeys: String, CodingKey { case isSuccess, errorMsg, data }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            isSuccess = try container.decode(Bool.self, forKey: .isSuccess)
+            errorMsg = try container.decodeIfPresent(String.self, forKey: .errorMsg)
+            // Successful payloads can be arrays or objects; failures can be NEED_LOGIN.
+            data = try? container.decode(String.self, forKey: .data)
+        }
+    }
+
+    private struct LoginResponse: Decodable {
+        struct User: Decodable { var accessToken: String? }
+        var data: User?
+    }
+
+    private let session: URLSession
+    private var tokens: [Credentials: String] = [:]
+    private var logins: [Credentials: Task<String, Error>] = [:]
+
+    init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = 20
+            config.waitsForConnectivity = false
+            // Use explicit tokens so two accounts on the same server never share cookies.
+            config.httpShouldSetCookies = false
+            config.httpCookieStorage = nil
+            self.session = URLSession(configuration: config)
+        }
+    }
+
+    func request<T: Decodable>(
+        _ path: String, body: [String: Any]? = nil, connection: NASConnection
+    ) async throws -> T {
+        let credentials = Credentials(
+            baseURL: connection.baseURL,
+            username: connection.username.trimmingCharacters(in: .whitespacesAndNewlines),
+            password: connection.password
+        )
+        for attempt in 0...1 {
+            let data = try await send(path, body: body, credentials: credentials, token: tokens[credentials])
+            let status = try JSONDecoder().decode(Status.self, from: data)
+            if !status.isSuccess, status.data == "NEED_LOGIN" {
+                tokens[credentials] = nil
+                guard attempt == 0 else {
+                    throw AppServiceError.serverError("登录已失效，请检查阅读服务器账号和密码后重试")
+                }
+                guard !credentials.username.isEmpty, !credentials.password.isEmpty else {
+                    throw AppServiceError.serverError("阅读服务器需要登录，请在连接设置中填写账号和密码")
+                }
+                tokens[credentials] = try await login(credentials)
+                continue
+            }
+            guard status.isSuccess else {
+                throw AppServiceError.serverError(status.errorMsg ?? "阅读服务器请求失败")
+            }
+            return try JSONDecoder.appDecoder.decode(T.self, from: data)
+        }
+        throw AppServiceError.invalidResponse
+    }
+
+    private func login(_ credentials: Credentials) async throws -> String {
+        if let pending = logins[credentials] { return try await pending.value }
+        let task = Task { @MainActor in
+            let data = try await self.send(
+                "reader3/login",
+                body: ["username": credentials.username, "password": credentials.password, "isLogin": true],
+                credentials: credentials, token: nil
+            )
+            let status = try JSONDecoder().decode(Status.self, from: data)
+            guard status.isSuccess else {
+                throw AppServiceError.serverError(status.errorMsg ?? "账号或密码不正确")
+            }
+            let response = try JSONDecoder().decode(LoginResponse.self, from: data)
+            guard let token = response.data?.accessToken, !token.isEmpty else {
+                throw AppServiceError.serverError("登录成功但未收到访问凭证，请检查 Reader 版本")
+            }
+            return token
+        }
+        logins[credentials] = task
+        defer { logins[credentials] = nil }
+        return try await task.value
+    }
+
+    private func send(
+        _ path: String, body: [String: Any]?, credentials: Credentials, token: String?
+    ) async throws -> Data {
+        guard let scheme = credentials.baseURL.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), credentials.baseURL.host != nil,
+              var components = URLComponents(
+                url: credentials.baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: true
+              ) else { throw AppServiceError.serverError("阅读服务器地址无效") }
+        if let token {
+            var items = components.queryItems ?? []
+            items.removeAll { $0.name == "accessToken" }
+            items.append(URLQueryItem(name: "accessToken", value: token))
+            components.queryItems = items
+            components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        }
+        guard let url = components.url else { throw AppServiceError.invalidResponse }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 20)
+        request.httpMethod = body == nil ? "GET" : "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Mozilla/5.0 YuanYue", forHTTPHeaderField: "User-Agent")
+        if !credentials.username.isEmpty {
+            let basic = Data("\(credentials.username):\(credentials.password)".utf8).base64EncodedString()
+            request.setValue("Basic \(basic)", forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw AppServiceError.invalidResponse }
+        switch http.statusCode {
+        case 200..<300: return data
+        case 401: throw AppServiceError.unauthorized
+        case 403: throw AppServiceError.forbidden
+        default: throw AppServiceError.serverError("阅读服务器返回 HTTP \(http.statusCode)")
+        }
+    }
+}
+
 struct LibraryCache {
     var rootURL: URL {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!

@@ -39,11 +39,15 @@ struct Book: Identifiable, Codable, Hashable, Sendable {
     /// breaks books whose URL contains embedded JSON (e.g. 阅读助手 source).
     var remoteBookURLString: String?
     var isReaderServerBacked: Bool?
+    /// Scopes shelf identity to one configured Reader server; nil for older libraries.
+    var readerServerConnectionID: UUID?
     var status: ReadingStatus
     var progress: ReadingProgress
     var chapters: [Chapter]
     var addedAt: Date
     var updatedAt: Date
+    /// Updated only by reading activity, independently of downloads and shelf sync.
+    var lastReadAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -58,11 +62,13 @@ struct Book: Identifiable, Codable, Hashable, Sendable {
         remoteBookURL: URL? = nil,
         remoteBookURLString: String? = nil,
         isReaderServerBacked: Bool = false,
+        readerServerConnectionID: UUID? = nil,
         status: ReadingStatus,
         progress: ReadingProgress,
         chapters: [Chapter],
         addedAt: Date,
-        updatedAt: Date
+        updatedAt: Date,
+        lastReadAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -76,11 +82,13 @@ struct Book: Identifiable, Codable, Hashable, Sendable {
         self.remoteBookURL = remoteBookURL
         self.remoteBookURLString = remoteBookURLString ?? remoteBookURL?.absoluteString
         self.isReaderServerBacked = isReaderServerBacked
+        self.readerServerConnectionID = readerServerConnectionID
         self.status = status
         self.progress = progress
         self.chapters = chapters
         self.addedAt = addedAt
         self.updatedAt = updatedAt
+        self.lastReadAt = lastReadAt
     }
 }
 
@@ -108,6 +116,16 @@ struct ReadingProgress: Codable, Hashable, Sendable {
     var chapterIndex: Int
     var scrollOffset: Double
     var percentage: Double
+    /// UTF-16 position in the paginated chapter, independent of screen size.
+    var pageCharacterOffset: Int?
+}
+
+enum ReaderReadingMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case scroll
+    case paged
+
+    var id: String { rawValue }
+    var title: String { self == .scroll ? "上下滚动" : "左右翻页" }
 }
 
 enum ReaderFontDesign: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -153,6 +171,18 @@ struct ReaderTheme: Identifiable, Codable, Hashable, Sendable {
     var isBold: Bool
     var foregroundHex: String
     var backgroundHex: String
+    var readingMode: ReaderReadingMode?
+    var tapBothSidesToAdvance: Bool?
+
+    var effectiveTapBothSidesToAdvance: Bool {
+        get { tapBothSidesToAdvance ?? false }
+        set { tapBothSidesToAdvance = newValue }
+    }
+
+    var effectiveReadingMode: ReaderReadingMode {
+        get { readingMode ?? .scroll }
+        set { readingMode = newValue }
+    }
 
     var effectiveCharacterSpacing: Double {
         get { characterSpacing ?? 0 }

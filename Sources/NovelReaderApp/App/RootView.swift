@@ -162,11 +162,16 @@ struct ServerSetupGuideView: View {
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty else { return nil }
         let p = port.trimmingCharacters(in: .whitespacesAndNewlines)
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = h
-        if let portNum = Int(p), portNum > 0 { components.port = portNum }
-        components.path = "/"
+        let isFullURL = h.contains("://")
+        guard var components = URLComponents(string: isFullURL ? h : "http://" + h),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let hostname = components.host, !hostname.isEmpty else { return nil }
+        if !isFullURL, components.port == nil, !p.isEmpty {
+            guard let portNum = Int(p), (1...65535).contains(portNum) else { return nil }
+            components.port = portNum
+        }
+        if let portNum = components.port, !(1...65535).contains(portNum) { return nil }
+        if !components.path.hasSuffix("/") { components.path += "/" }
         return components.url
     }
 
@@ -201,7 +206,7 @@ struct ServerSetupGuideView: View {
 
                         PremiumCard {
                             VStack(spacing: 0) {
-                                setupField(label: "IP / 域名", placeholder: "192.168.1.100", text: $host)
+                                setupField(label: "IP / 域名", placeholder: "IP、域名或完整 URL", text: $host)
                                 RowDivider()
                                 setupField(label: "端口号", placeholder: "4396", text: $port)
                             }
@@ -307,46 +312,27 @@ struct ServerSetupGuideView: View {
 
         Task {
             do {
-                var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 8)
-                if !username.trimmingCharacters(in: .whitespaces).isEmpty {
-                    let cred = "\(username):\(password)"
-                    if let data = cred.data(using: .utf8) {
-                        request.setValue("Basic \(data.base64EncodedString())", forHTTPHeaderField: "Authorization")
-                    }
-                }
-                let (_, response) = try await URLSession.shared.data(for: request)
-                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if code >= 200 && code < 500 {
-                    addConnectionAndClose(url: url)
-                } else {
-                    isTesting = false
-                    testResult = .failure("服务器返回异常状态码 \(code)")
-                }
+                let connection = NASConnection(
+                    id: store.nasConnections.first(where: { $0.kind == .readerServer })?.id ?? UUID(),
+                    name: "阅读服务器", kind: .readerServer, baseURL: url,
+                    username: username.trimmingCharacters(in: .whitespacesAndNewlines),
+                    password: password, isEnabled: true
+                )
+                try await store.validateReaderServerConnection(connection)
+                addConnectionAndClose(connection)
             } catch {
-                addConnectionAndClose(url: url)
+                isTesting = false
+                testResult = .failure(error.localizedDescription)
             }
         }
     }
 
-    private func addConnectionAndClose(url: URL) {
-        let connection = NASConnection(
-            name: "阅读服务器",
-            kind: .readerServer,
-            baseURL: url,
-            username: username.trimmingCharacters(in: .whitespaces),
-            password: password,
-            isEnabled: true
-        )
-        if let idx = store.nasConnections.firstIndex(where: { $0.kind == .readerServer }) {
-            store.nasConnections[idx] = connection
-        } else {
-            store.nasConnections.insert(connection, at: 0)
-        }
-        store.save()
+    private func addConnectionAndClose(_ connection: NASConnection) {
+        store.updateConnection(connection)
         isTesting = false
         testResult = .success
         store.showServerSetup = false
-        store.activityMessage = "已添加阅读服务器：\(url.host ?? "")"
+        store.activityMessage = "已添加阅读服务器：\(connection.baseURL.host ?? "")"
         Task {
             await store.syncReaderServerShelfToLocal()
         }

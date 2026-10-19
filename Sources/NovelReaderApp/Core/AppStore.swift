@@ -49,6 +49,7 @@ final class AppStore: ObservableObject {
     @Published var pendingReaderSyncBookIDs: Set<UUID> = []
     @Published var isReaderServerReachable = false
     @Published var isReaderServerSyncing = false
+    @Published var readerServerSyncMessage = ""
     @Published var lastReaderServerSyncAt: Date?
     @Published var showServerSetup = false
 
@@ -60,6 +61,7 @@ final class AppStore: ObservableObject {
     private lazy var storage: LibraryStorage = SQLiteLibraryStorage()
     private let sourceEngine = BookSourceEngine()
     private let webDAVClient = WebDAVClient()
+    private let readerServerAPI = ReaderServerAPI()
     private let cache = LibraryCache()
     private let bonjourBrowser = BonjourNASBrowser()
     private let backgroundDownloadService = BackgroundDownloadService()
@@ -78,6 +80,7 @@ final class AppStore: ObservableObject {
     private let maxConcurrentDownloads = 3
 
     init() {
+        ImportedFontLibrary().registerImportedFonts()
         activityMessage = "正在加载本地书库"
         Task {
             await loadAtStartup()
@@ -114,7 +117,14 @@ final class AppStore: ObservableObject {
     }
 
     private func applyLoadedSnapshot(_ snapshot: LibrarySnapshot) {
-        books = snapshot.books
+        books = snapshot.books.map { book in
+            var migrated = book
+            // Older libraries have no dedicated reading timestamp.
+            if migrated.lastReadAt == nil, migrated.status != .unread {
+                migrated.lastReadAt = migrated.updatedAt
+            }
+            return migrated
+        }
         sources = snapshot.sources.map { source in
             var migrated = source
             migrated.rule.searchPath = LegadoSourceAdapter.normalizeImportedSearchPath(source.rule.searchPath)
@@ -264,12 +274,23 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func updateProgress(bookID: UUID, chapterIndex: Int, percentage: Double) {
+    func recordReading(bookID: UUID) {
+        guard let index = books.firstIndex(where: { $0.id == bookID }) else { return }
+        books[index].lastReadAt = .now
+        if selectedBook?.id == bookID {
+            selectedBook = books[index]
+        }
+        save()
+    }
+
+    func updateProgress(bookID: UUID, chapterIndex: Int, percentage: Double, pageCharacterOffset: Int? = nil) {
         guard let index = books.firstIndex(where: { $0.id == bookID }) else { return }
         books[index].progress.chapterIndex = chapterIndex
         books[index].progress.percentage = percentage
+        books[index].progress.pageCharacterOffset = pageCharacterOffset
         books[index].status = percentage >= 0.99 ? .finished : .reading
         books[index].updatedAt = .now
+        books[index].lastReadAt = books[index].updatedAt
         if selectedBook?.id == bookID {
             selectedBook = books[index]
         }
@@ -799,6 +820,13 @@ final class AppStore: ObservableObject {
         activityMessage = "正在从 Reader 服务读取：\(chapter.title)"
         do {
             let content = try await readerServerContent(bookURLString: remoteBookURLString, index: serverChapterIndex, connection: connection)
+            // Shelf sync can switch sources while this request is in flight.
+            guard let current = books.first(where: { $0.id == bookID }),
+                  (current.remoteBookURLString ?? current.remoteBookURL?.absoluteString) == remoteBookURLString,
+                  current.chapters.indices.contains(chapterIndex),
+                  readerServerIndex(for: current.chapters[chapterIndex], fallback: chapterIndex) == serverChapterIndex else {
+                return false
+            }
             storeReaderServerContent(content, bookID: bookID, chapterIndex: chapterIndex)
             activityMessage = content.isEmpty ? "Reader 返回空章节：\(chapter.title)" : "已读取并缓存：\(chapter.title)"
             return true
@@ -1341,6 +1369,7 @@ final class AppStore: ObservableObject {
     }
 
     func syncReaderServerShelfToLocal() async {
+        guard !isReaderServerSyncing else { return }
         guard let connection = readerServerConnection else {
             isReaderServerReachable = false
             activityMessage = "还没有配置阅读服务器"
@@ -1350,37 +1379,47 @@ final class AppStore: ObservableObject {
         isReaderServerSyncing = true
         defer { isReaderServerSyncing = false }
 
+        readerServerSyncMessage = "正在连接并验证阅读服务器…"
+        activityMessage = readerServerSyncMessage
         do {
             let shelf: ReaderServerEnvelope<[ReaderServerShelfBook]> = try await readerServerGET("reader3/getShelfBookWithCacheInfo", connection: connection)
             guard shelf.isSuccess, let shelfBooks = shelf.data else {
-                activityMessage = shelf.errorMsg?.isEmpty == false ? shelf.errorMsg! : "Reader 书架同步失败"
-                return
+                throw AppServiceError.serverError(shelf.errorMsg ?? "Reader 书架同步失败")
             }
 
+            isReaderServerReachable = true
             var importedCount = 0
             var updatedCount = 0
+            let serverBookURLs = Set(shelfBooks.map(\.bookUrl))
 
-            for shelfBook in shelfBooks {
-                guard let remoteURL = URL(string: shelfBook.bookUrl) else { continue }
+            for (offset, shelfBook) in shelfBooks.enumerated() {
+                readerServerSyncMessage = "正在同步 \(offset + 1)/\(shelfBooks.count)：\(shelfBook.name)"
+                activityMessage = readerServerSyncMessage
+                guard URL(string: shelfBook.bookUrl) != nil else { continue }
                 let originalBookURLString = shelfBook.bookUrl
                 let chapters = (try? await readerServerChapters(for: shelfBook, connection: connection)) ?? []
                 let currentIndex = max(shelfBook.durChapterIndex ?? 0, 0)
                 let currentContent = (try? await readerServerContent(bookURLString: originalBookURLString, index: currentIndex, connection: connection)) ?? ""
                 let coverImageURL = await readerServerCoverURL(for: shelfBook, connection: connection)
-                let book = makeLocalBook(from: shelfBook, chapters: chapters, currentContent: currentContent, coverImageURL: coverImageURL)
+                var book = makeLocalBook(from: shelfBook, chapters: chapters, currentContent: currentContent, coverImageURL: coverImageURL)
+                book.readerServerConnectionID = connection.id
+                let eligibleIDs = Set(books.filter {
+                    $0.isReaderServerBacked == true || ($0.isReaderServerBacked == nil && isReaderServerBackedBook($0))
+                }.map(\.id))
+                let result = ReaderShelfReconciler.reconcile(
+                    incoming: book, localBooks: books, serverBookURLs: serverBookURLs,
+                    eligibleBookIDs: eligibleIDs, pendingProgressIDs: pendingReaderSyncBookIDs
+                )
 
-                if let index = books.firstIndex(where: { $0.remoteBookURL == remoteURL }) {
-                    books[index].summary = book.summary
-                    books[index].sourceName = book.sourceName
-                    books[index].remoteBookURL = remoteURL
-                    books[index].remoteBookURLString = originalBookURLString
-                    books[index].isReaderServerBacked = true
-                    books[index].coverImageURL = book.coverImageURL ?? books[index].coverImageURL
-                    books[index].progress = book.progress
-                    books[index].updatedAt = .now
-                    if !book.chapters.isEmpty {
-                        books[index].chapters = mergeLocalChapters(existing: books[index].chapters, incoming: book.chapters)
+                if let index = books.firstIndex(where: { result.replacedBookIDs.contains($0.id) }) {
+                    invalidateReaderDownloads(for: result.invalidatedDownloadBookIDs)
+                    books.removeAll { result.replacedBookIDs.contains($0.id) }
+                    books.insert(result.book, at: min(index, books.count))
+                    if let selectedBook, result.replacedBookIDs.contains(selectedBook.id) {
+                        self.selectedBook = result.book
                     }
+                    pendingReaderSyncBookIDs.subtract(result.replacedBookIDs)
+                    if result.hasPendingProgress { pendingReaderSyncBookIDs.insert(result.book.id) }
                     updatedCount += 1
                 } else {
                     books.insert(book, at: 0)
@@ -1391,14 +1430,29 @@ final class AppStore: ObservableObject {
             lastReaderServerSyncAt = .now
             persistReaderSyncState()
             save()
-            activityMessage = "已同步 Reader 书架：新增 \(importedCount) 本，更新 \(updatedCount) 本"
+            readerServerSyncMessage = "已同步 Reader 书架：新增 \(importedCount) 本，更新 \(updatedCount) 本"
+            activityMessage = readerServerSyncMessage
         } catch {
-            activityMessage = "Reader 书架同步失败：\(error.localizedDescription)"
+            isReaderServerReachable = false
+            readerServerSyncMessage = "Reader 书架同步失败：\(error.localizedDescription)"
+            activityMessage = readerServerSyncMessage
         }
     }
 
     private var readerServerConnection: NASConnection? {
         nasConnections.first { $0.kind == .readerServer && $0.isEnabled }
+    }
+
+    private func invalidateReaderDownloads(for bookIDs: Set<UUID>) {
+        guard !bookIDs.isEmpty else { return }
+        for task in downloads where bookIDs.contains(task.bookID) {
+            downloadWorkers[task.id]?.cancel()
+            downloadWorkers[task.id] = nil
+        }
+        downloads.removeAll { bookIDs.contains($0.bookID) }
+        if let continuation = pendingCacheContinuation, bookIDs.contains(continuation.bookID) {
+            pendingCacheContinuation = nil
+        }
     }
 
     private func markBookNeedsReaderSync(_ bookID: UUID) {
@@ -1436,89 +1490,34 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Test the actual API, including Reader login, before saving a connection.
+    func validateReaderServerConnection(_ connection: NASConnection) async throws {
+        let shelf: ReaderServerEnvelope<[ReaderServerShelfBook]> = try await readerServerGET(
+            "reader3/getShelfBookWithCacheInfo", connection: connection
+        )
+        guard shelf.data != nil else { throw AppServiceError.invalidResponse }
+    }
+
     private func pushProgress(_ book: Book, toReaderServer connection: NASConnection) async throws {
-        guard let remoteBookURLString = book.remoteBookURLString ?? book.remoteBookURL?.absoluteString,
-              let url = URL(string: "reader3/saveBookProgress", relativeTo: connection.baseURL)?.absoluteURL else {
+        guard let remoteBookURLString = book.remoteBookURLString ?? book.remoteBookURL?.absoluteString else {
             throw AppServiceError.invalidResponse
         }
-
-        var request = URLRequest(url: url, timeoutInterval: 5)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("Mozilla/5.0 YuanYue", forHTTPHeaderField: "User-Agent")
         let localIndex = min(max(book.progress.chapterIndex, 0), max(book.chapters.count - 1, 0))
         let serverIndex = book.chapters.indices.contains(localIndex)
             ? readerServerIndex(for: book.chapters[localIndex], fallback: localIndex)
             : localIndex
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "url": remoteBookURLString,
-            "index": serverIndex
-        ])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw AppServiceError.invalidResponse
-        }
-        if let envelope = try? JSONDecoder.appDecoder.decode(ReaderServerStatusEnvelope.self, from: data),
-           !envelope.isSuccess {
-            throw AppServiceError.invalidResponse
-        }
-    }
-
-    // Shared ephemeral session — bypasses NSURLCache, avoids "data missing" file errors.
-    private let readerSession: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 12
-        config.waitsForConnectivity = false
-        return URLSession(configuration: config)
-    }()
-
-    private func readerServerAuthHeader(for connection: NASConnection) -> String? {
-        guard !connection.username.isEmpty else { return nil }
-        let cred = "\(connection.username):\(connection.password)"
-        guard let data = cred.data(using: .utf8) else { return nil }
-        return "Basic \(data.base64EncodedString())"
+        let _: ReaderServerStatusEnvelope = try await readerServerAPI.request(
+            "reader3/saveBookProgress",
+            body: ["url": remoteBookURLString, "index": serverIndex], connection: connection
+        )
     }
 
     private func readerServerGET<T: Decodable>(_ path: String, connection: NASConnection) async throws -> T {
-        guard let url = URL(string: path, relativeTo: connection.baseURL)?.absoluteURL else {
-            throw AppServiceError.invalidResponse
-        }
-        var request = URLRequest(url: url, timeoutInterval: 8)
-        request.httpMethod = "GET"
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("Mozilla/5.0 YuanYue", forHTTPHeaderField: "User-Agent")
-        if let auth = readerServerAuthHeader(for: connection) {
-            request.setValue(auth, forHTTPHeaderField: "Authorization")
-        }
-        let (data, response) = try await readerSession.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw AppServiceError.invalidResponse
-        }
-        return try JSONDecoder.appDecoder.decode(T.self, from: data)
+        try await readerServerAPI.request(path, connection: connection)
     }
 
     private func readerServerPOST<T: Decodable>(_ path: String, body: [String: Any], connection: NASConnection) async throws -> T {
-        guard let url = URL(string: path, relativeTo: connection.baseURL)?.absoluteURL else {
-            throw AppServiceError.invalidResponse
-        }
-        var request = URLRequest(url: url, timeoutInterval: 20)
-        request.httpMethod = "POST"
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("Mozilla/5.0 YuanYue", forHTTPHeaderField: "User-Agent")
-        if let auth = readerServerAuthHeader(for: connection) {
-            request.setValue(auth, forHTTPHeaderField: "Authorization")
-        }
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await readerSession.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw AppServiceError.invalidResponse
-        }
-        return try JSONDecoder.appDecoder.decode(T.self, from: data)
+        try await readerServerAPI.request(path, body: body, connection: connection)
     }
 
     private func readerServerChapters(for book: ReaderServerShelfBook, connection: NASConnection) async throws -> [ReaderServerChapter] {
@@ -1628,6 +1627,7 @@ final class AppStore: ObservableObject {
             chapterModels = [
                 Chapter(
                     index: 0,
+                    remoteIndex: currentRemoteIndex,
                     title: shelfBook.durChapterTitle ?? "当前章节",
                     url: shelfBook.tocUrl.flatMap(URL.init(string:)),
                     localText: normalizeReaderServerContent(currentContent),
@@ -1669,36 +1669,6 @@ final class AppStore: ObservableObject {
             addedAt: .now,
             updatedAt: .now
         )
-    }
-
-    private func mergeLocalChapters(existing: [Chapter], incoming: [Chapter]) -> [Chapter] {
-        guard !existing.isEmpty else { return incoming }
-        var merged = incoming
-        for index in merged.indices {
-            if merged[index].localText.isEmpty,
-               let oldChapter = matchingExistingChapter(for: merged[index], in: existing),
-               !oldChapter.localText.isEmpty {
-                merged[index].localText = oldChapter.localText
-                merged[index].isDownloaded = oldChapter.isDownloaded
-            }
-        }
-        return merged
-    }
-
-    private func matchingExistingChapter(for incoming: Chapter, in existing: [Chapter]) -> Chapter? {
-        if let remoteIndex = incoming.remoteIndex,
-           let match = existing.first(where: { $0.remoteIndex == remoteIndex }) {
-            return match
-        }
-        if let url = incoming.url,
-           let match = existing.first(where: { $0.url == url }) {
-            return match
-        }
-        if let match = existing.first(where: { $0.title == incoming.title }) {
-            return match
-        }
-        guard incoming.remoteIndex == nil else { return nil }
-        return existing.first { $0.remoteIndex == nil && $0.index == incoming.index }
     }
 
     private func installDefaultReaderServerIfNeeded() {
@@ -1901,7 +1871,8 @@ final class AppStore: ObservableObject {
                     format: $0.format,
                     status: $0.status,
                     progress: $0.progress,
-                    updatedAt: $0.updatedAt
+                    updatedAt: $0.updatedAt,
+                    lastReadAt: $0.lastReadAt
                 )
             },
             readerTheme: readerTheme,
@@ -1916,6 +1887,9 @@ final class AppStore: ObservableObject {
                 books[index].status = metadata.status
                 books[index].progress = metadata.progress
                 books[index].updatedAt = metadata.updatedAt
+                if let lastReadAt = metadata.lastReadAt {
+                    books[index].lastReadAt = max(books[index].lastReadAt ?? .distantPast, lastReadAt)
+                }
             }
         }
     }

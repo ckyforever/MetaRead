@@ -46,8 +46,8 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         NSLocalNetworkUsageDescription: 用于发现并连接家中的 NAS 服务。
         NSAppTransportSecurity:
+          # User-configured Reader servers and book sources may use HTTP.
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
         NSBonjourServices:
           - _webdav._tcp
           - _http._tcp
@@ -87,8 +87,8 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSLocalNetworkUsageDescription: 用于发现并连接家中的 NAS 服务。
         NSAppTransportSecurity:
+          # User-configured Reader servers and book sources may use HTTP.
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
         NSBonjourServices:
           - _webdav._tcp
           - _http._tcp
@@ -125,8 +125,8 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSLocalNetworkUsageDescription: 用于连接家中的阅读服务器。
         NSAppTransportSecurity:
+          # User-configured Reader servers and book sources may use HTTP.
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
         NSBonjourServices:
           - _http._tcp
     settings:
